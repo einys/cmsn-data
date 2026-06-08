@@ -11,6 +11,7 @@ serde_json = "1.0"
 hex = "0.4"           # Hex 문자열을 바이너리로 변환
 flate2 = "1.0"        # Gzip 압축 해제
 plotters = "0.3"    # 시각화
+chrono = "0.4"      # 타임스탬프 처리
 
 # 수학 및 통계 연산 (엔트로피용)
 num-traits = "0.2"
