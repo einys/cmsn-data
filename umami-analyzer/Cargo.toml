@@ -1,0 +1,19 @@
+[package]
+name = "umami-analyzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# SQL 및 텍스트 파싱을 위한 도구
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"           # Hex 문자열을 바이너리로 변환
+flate2 = "1.0"        # Gzip 압축 해제
+plotters = "0.3"    # 시각화
+
+# 수학 및 통계 연산 (엔트로피용)
+num-traits = "0.2"
+
+# [추후 단계] Rust 내장 딥러닝 프레임워크
+# burn = { version = "0.13", features = ["wgpu"] } # 필요할 때 주석 해제
