@@ -232,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_entropy_histogram(data: &[f64]) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 도화지 세팅 (800x600 픽셀 크기의 PNG 파일 생성)
-    let root = BitMapBackend::new("entropy_distribution.png", (800, 600)).into_drawing_area();
+    let root = BitMapBackend::new("mouse_entropy_distribution.png", (800, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
     // 1.5 데이터를 0.2 단위의 버킷(Bin)으로 쪼개서 히스토그램 데이터 생성
@@ -270,7 +270,7 @@ fn draw_entropy_histogram(data: &[f64]) -> Result<(), Box<dyn std::error::Error>
     }))?;
 
     root.present()?;
-    println!("📊 [시각화 완료] 'entropy_distribution.png' 파일이 저장되었습니다.");
+    println!("📊 [시각화 완료] 'mouse_entropy_distribution.png' 파일이 저장되었습니다.");
 
     Ok(())
 }

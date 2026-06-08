@@ -1,8 +1,11 @@
 use chrono::DateTime;
 use plotters::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+
+const OUT_DIR: &str = "output";
+const MIN_EVENTS: usize = 30; // 통계 신뢰를 위한 최소 이벤트 수
 
 // ==========================================
 // 1. 데이터 구조체
@@ -16,22 +19,19 @@ struct WebEvent {
 #[derive(Debug, Clone)]
 struct SessionFeatures {
     visit_id: String,
-    is_bot: bool,
+    step_count: usize,
     std_dwell: f64,
     cv_dwell: f64,
-    entropy_seq: f64,
-    trans_entropy: f64,
+    entropy_dwell: f64,
     repeat_ratio: f64,
-    anomaly_score: f64,
-    step_count: usize,
+    autocorr_lag1: f64, // 체류시간 자기상관 (lag-1)
 }
 
 struct AnalysisResult {
-    human_transitions: HashMap<(String, String), usize>,
-    bot_transitions: HashMap<(String, String), usize>,
+    transitions: HashMap<(String, String), usize>,
     all_states: HashSet<String>,
-    human_count: usize,
-    bot_count: usize,
+    session_count: usize,
+    skipped_count: usize, // MIN_EVENTS 미만으로 스킵된 세션 수
     session_features: Vec<SessionFeatures>,
 }
 
@@ -145,35 +145,26 @@ fn calc_std(vals: &[f64]) -> f64 {
     var.sqrt()
 }
 
-fn calc_shannon_entropy(items: &[String]) -> f64 {
-    if items.is_empty() {
+// 체류 시간 시퀀스의 불확실성(엔트로피)을 측정
+// 연속형 변수인 초(seconds) 단위를 0.5초 혹은 1초 버킷으로 양자화하여 계산합니다.
+// 인간은 체류 시간이 다양해서 엔트로피가 높고, 봇은 일정해서 엔트로피가 낮게 나옵니다.
+fn calc_dwell_entropy(vals: &[f64]) -> f64 {
+    if vals.is_empty() {
         return 0.0;
     }
-    let mut freq: HashMap<&str, usize> = HashMap::new();
-    for s in items {
-        *freq.entry(s.as_str()).or_insert(0) += 1;
+
+    let mut freq: HashMap<i64, usize> = HashMap::new();
+    for &v in vals {
+        // 0.5초 단위 버킷으로 범주화 (예: 1.2s -> bucket 2, 1.4s -> bucket 3)
+        // 만약 해상도를 더 넓히고 싶다면 (v).round() as i64 (1초 단위)로 변경 가능
+        let bucket = (v * 2.0).round() as i64;
+        *freq.entry(bucket).or_insert(0) += 1;
     }
-    let n = items.len() as f64;
+
+    let n = vals.len() as f64;
     freq.values()
         .map(|&c| {
             let p = c as f64 / n;
-            -p * p.log2()
-        })
-        .sum()
-}
-
-fn calc_transition_entropy(pages: &[String]) -> f64 {
-    if pages.len() < 2 {
-        return 0.0;
-    }
-    let mut freq: HashMap<(&str, &str), usize> = HashMap::new();
-    for w in pages.windows(2) {
-        *freq.entry((w[0].as_str(), w[1].as_str())).or_insert(0) += 1;
-    }
-    let total = (pages.len() - 1) as f64;
-    freq.values()
-        .map(|&c| {
-            let p = c as f64 / total;
             -p * p.log2()
         })
         .sum()
@@ -193,19 +184,20 @@ fn calc_repeat_ratio(vals: &[f64]) -> f64 {
     max_repeat as f64 / vals.len() as f64
 }
 
-// anomaly score: 높을수록 봇 가능성 높음
-// CV 낮음, 엔트로피 낮음, 전이엔트로피 낮음, 반복비율 높음 → 봇
-fn calc_anomaly_score(cv: f64, entropy: f64, trans_entropy: f64, repeat_ratio: f64) -> f64 {
-    // 각 피처를 [0,1]로 클리핑 후 가중 합산
-    // CV: 낮을수록 봇 → (1 - min(cv/3, 1)) * weight
-    // entropy: 낮을수록 봇 → (1 - min(entropy/2, 1)) * weight
-    // trans_entropy: 낮을수록 봇 → (1 - min(trans_entropy/2, 1)) * weight
-    // repeat_ratio: 높을수록 봇 → repeat_ratio * weight
-    let cv_score = (1.0 - (cv / 3.0).min(1.0)) * 0.30;
-    let ent_score = (1.0 - (entropy / 2.0).min(1.0)) * 0.25;
-    let trans_score = (1.0 - (trans_entropy / 2.0).min(1.0)) * 0.25;
-    let rep_score = repeat_ratio.min(1.0) * 0.20;
-    cv_score + ent_score + trans_score + rep_score
+// lag-1 자기상관: 체류시간 시퀀스의 주기성 측정
+// 봇은 절댓값이 크게 나옴 (양수: 같은 값 반복 / 음수: 교대 반복)
+// 인간은 대체로 0에 가까움
+fn calc_autocorr_lag1(vals: &[f64]) -> f64 {
+    if vals.len() < 3 {
+        return 0.0;
+    }
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    let numerator: f64 = vals.windows(2).map(|w| (w[0] - mean) * (w[1] - mean)).sum();
+    let denominator: f64 = vals.iter().map(|v| (v - mean).powi(2)).sum();
+    if denominator == 0.0 {
+        return 0.0;
+    }
+    numerator / denominator
 }
 
 // ==========================================
@@ -219,18 +211,22 @@ fn analyze_sessions(
     writeln!(csv_file, "visit_id,path_sequence")?;
 
     let mut result = AnalysisResult {
-        human_transitions: HashMap::new(),
-        bot_transitions: HashMap::new(),
+        transitions: HashMap::new(),
         all_states: HashSet::new(),
-        human_count: 0,
-        bot_count: 0,
+        session_count: 0,
+        skipped_count: 0,
         session_features: Vec::new(),
     };
 
-    println!("=== 🔍 세션별 시퀀스 마이닝 및 봇 시나리오 매칭 ===");
+    println!(
+        "=== 🔍 세션별 시퀀스 마이닝 (MIN_EVENTS={}) ===",
+        MIN_EVENTS
+    );
 
     for (visit_id, events) in visit_routes.iter_mut() {
-        if events.len() < 3 {
+        // MIN_EVENTS 미만 세션 스킵
+        if events.len() < MIN_EVENTS {
+            result.skipped_count += 1;
             continue;
         }
 
@@ -240,6 +236,7 @@ fn analyze_sessions(
             .iter()
             .map(|e| categorize_path(&e.url_path))
             .collect();
+
         for cat in &categories {
             result.all_states.insert(cat.clone());
         }
@@ -249,84 +246,53 @@ fn analyze_sessions(
             .map(|i| (events[i + 1].created_at - events[i].created_at) as f64 / 1000.0)
             .collect();
 
-        // 봇 판별 (기존 로직 유지)
-        let mut loop_count = 0;
-        for window in categories.windows(2) {
-            if (window[0] == "[List]" && window[1] == "[Detail]")
-                || (window[0] == "[Detail]" && window[1] == "[List]")
-            {
-                loop_count += 1;
-            }
-        }
-        let loop_ratio = loop_count as f64 / (categories.len() - 1) as f64;
-        let is_bot = loop_ratio > 0.8 && categories.len() >= 6;
-
         // 특징 계산
-        let mean_dwell = if dwell_times.is_empty() {
-            0.0
-        } else {
-            dwell_times.iter().sum::<f64>() / dwell_times.len() as f64
-        };
+        let mean_dwell = dwell_times.iter().sum::<f64>() / dwell_times.len() as f64;
         let std_dwell = calc_std(&dwell_times);
         let cv_dwell = if mean_dwell > 0.0 {
             std_dwell / mean_dwell
         } else {
             0.0
         };
-        let entropy_seq = calc_shannon_entropy(&categories);
-        let trans_entropy = calc_transition_entropy(&categories);
+        let entropy_dwell = calc_dwell_entropy(&dwell_times);
         let repeat_ratio = calc_repeat_ratio(&dwell_times);
-        let anomaly_score = calc_anomaly_score(cv_dwell, entropy_seq, trans_entropy, repeat_ratio);
+        let autocorr_lag1 = calc_autocorr_lag1(&dwell_times);
 
         result.session_features.push(SessionFeatures {
             visit_id: visit_id.clone(),
-            is_bot,
+            step_count: categories.len(),
             std_dwell,
             cv_dwell,
-            entropy_seq,
-            trans_entropy,
+            entropy_dwell,
             repeat_ratio,
-            anomaly_score,
-            step_count: categories.len(),
+            autocorr_lag1,
         });
 
-        let target_matrix = if is_bot {
-            result.bot_count += 1;
-            &mut result.bot_transitions
-        } else {
-            result.human_count += 1;
-            &mut result.human_transitions
-        };
-
-        // 전이 매트릭스 업데이트
+        // 전이 매트릭스 업데이트 및 CSV 기록
         let mut timed_sequence = Vec::new();
         for i in 0..categories.len() - 1 {
             let from = &categories[i];
             let to = &categories[i + 1];
-            *target_matrix.entry((from.clone(), to.clone())).or_insert(0) += 1;
-            let dwell_secs = (events[i + 1].created_at - events[i].created_at) as f64 / 1000.0;
-            timed_sequence.push(format!("{}({:.2}s)", from, dwell_secs));
+            *result
+                .transitions
+                .entry((from.clone(), to.clone()))
+                .or_insert(0) += 1;
+            timed_sequence.push(format!("{}({:.2}s)", from, dwell_times[i]));
         }
         timed_sequence.push(categories.last().unwrap().clone());
         writeln!(csv_file, "{},\"{}\"", visit_id, timed_sequence.join(" ➔ "))?;
 
-        let short_id = &visit_id[..visit_id.len().min(8)];
-        if is_bot {
+        result.session_count += 1;
+
+        if result.session_count <= 5 {
             println!(
-                "🚨 [BOT] {}.. | 이동: {} | 매칭률: {:.1}% | CV: {:.2} | Entropy: {:.2}",
-                short_id,
-                events.len(),
-                loop_ratio * 100.0,
+                "🎯 {}.. | steps:{} | std:{:.2} | cv:{:.2} | ent:{:.2} | autocorr:{:.3}",
+                &visit_id[..visit_id.len().min(8)],
+                categories.len(),
+                std_dwell,
                 cv_dwell,
-                entropy_seq
-            );
-        } else if result.human_count <= 5 {
-            println!(
-                "🎯 [HUMAN] {}.. | 이동: {} | CV: {:.2} | Entropy: {:.2}",
-                short_id,
-                events.len(),
-                cv_dwell,
-                entropy_seq
+                entropy_dwell,
+                autocorr_lag1,
             );
         }
     }
@@ -335,7 +301,7 @@ fn analyze_sessions(
 }
 
 // ==========================================
-// 6. 시각화: 전이 확률 히트맵 (정규화)
+// 6. 시각화: 전이 확률 히트맵
 // ==========================================
 fn draw_transition_heatmap(
     matrix: &HashMap<(String, String), usize>,
@@ -347,7 +313,6 @@ fn draw_transition_heatmap(
         return Ok(());
     }
 
-    // 행별 합계로 확률 정규화
     let mut row_sums: HashMap<&str, usize> = HashMap::new();
     for ((from, _), &cnt) in matrix {
         *row_sums.entry(from.as_str()).or_insert(0) += cnt;
@@ -362,14 +327,12 @@ fn draw_transition_heatmap(
     let root = BitMapBackend::new(file_path, (w, h)).into_drawing_area();
     root.fill(&WHITE)?;
 
-    // 타이틀
     root.draw(&Text::new(
         title,
         (w as i32 / 2 - 150, 15),
         ("sans-serif", 22).into_font().color(&BLACK),
     ))?;
 
-    // 컬럼 헤더 (to)
     for (j, to) in states.iter().enumerate() {
         let x = margin as i32 + j as i32 * cell_px as i32 + cell_px as i32 / 2 - 20;
         root.draw(&Text::new(
@@ -379,7 +342,6 @@ fn draw_transition_heatmap(
         ))?;
     }
 
-    // 행 헤더 (from) + 셀
     for (i, from) in states.iter().enumerate() {
         let y = margin as i32 + i as i32 * cell_px as i32 + cell_px as i32 / 2 - 8;
         root.draw(&Text::new(
@@ -405,15 +367,18 @@ fn draw_transition_heatmap(
             let x1 = x0 + cell_px as i32;
             let y1 = y0 + cell_px as i32;
 
-            // 파란색 계열 그라디언트: 0 → 흰색, 1 → 진파랑
             let r = (255.0 - prob * 200.0) as u8;
             let g = (255.0 - prob * 150.0) as u8;
             let b = 255u8;
-            let fill_color = RGBColor(r, g, b).filled();
-            let border_color = RGBColor(200, 200, 200).stroke_width(1);
 
-            root.draw(&Rectangle::new([(x0, y0), (x1, y1)], fill_color))?;
-            root.draw(&Rectangle::new([(x0, y0), (x1, y1)], border_color))?;
+            root.draw(&Rectangle::new(
+                [(x0, y0), (x1, y1)],
+                RGBColor(r, g, b).filled(),
+            ))?;
+            root.draw(&Rectangle::new(
+                [(x0, y0), (x1, y1)],
+                RGBColor(200, 200, 200).stroke_width(1),
+            ))?;
 
             if count > 0 {
                 let label = format!("{:.0}%", prob * 100.0);
@@ -427,7 +392,6 @@ fn draw_transition_heatmap(
         }
     }
 
-    // 축 레이블
     root.draw(&Text::new(
         "To →",
         (w as i32 / 2 - 20, margin as i32 - 55),
@@ -449,43 +413,46 @@ fn draw_transition_heatmap(
 }
 
 // ==========================================
-// 7. 시각화: 히스토그램 (인간 vs 봇 오버레이)
+// 7. 시각화: 단일 히스토그램
 // ==========================================
-fn draw_histogram_overlay(
-    human_vals: &[f64],
-    bot_vals: &[f64],
+fn draw_histogram(
+    vals: &[f64],
     title: &str,
     x_label: &str,
     file_path: &str,
     bins: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let all_vals: Vec<f64> = human_vals.iter().chain(bot_vals.iter()).cloned().collect();
-    if all_vals.is_empty() {
+    if vals.is_empty() {
         return Ok(());
     }
 
-    let x_min = 0.0f64;
-    let x_max = all_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max) * 1.1;
+    // 자기상관은 음수 포함이므로 x_min을 데이터 기준으로 잡음
+    let mut x_min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut x_max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // 안전하게 그래프 여백(Margin) 처리: 양수/음수 상관없이 절대값의 10%를 여백으로 둠
+    x_min = if x_min > 0.0 {
+        0.0
+    } else {
+        x_min - x_min.abs() * 0.1
+    };
+    x_max = x_max + x_max.abs() * 0.1;
+
+    // 만약 데이터가 모두 0.0이거나 같은 값이라서 min == max가 된 경우, 범위를 억지로 벌려줌
+    if (x_max - x_min).abs() < f64::EPSILON {
+        x_max += 1.0;
+        x_min -= if x_min == 0.0 { 0.0 } else { 1.0 };
+    }
+
     let bin_width = (x_max - x_min) / bins as f64;
 
-    let count_bins = |vals: &[f64]| -> Vec<u32> {
-        let mut counts = vec![0u32; bins];
-        for &v in vals {
-            let i = ((v - x_min) / bin_width).floor() as usize;
-            let i = i.min(bins - 1);
-            counts[i] += 1;
-        }
-        counts
-    };
+    let mut counts = vec![0u32; bins];
+    for &v in vals {
+        // bin_width가 0이 아님이 보장되므로 안전하게 계산
+        let i = ((v - x_min) / bin_width).floor() as usize;
+        counts[i.min(bins - 1)] += 1;
+    }
 
-    let human_counts = count_bins(human_vals);
-    let bot_counts = count_bins(bot_vals);
-    let y_max = human_counts
-        .iter()
-        .chain(bot_counts.iter())
-        .max()
-        .copied()
-        .unwrap_or(1);
+    let y_max = counts.iter().max().copied().unwrap_or(1);
 
     let root = BitMapBackend::new(file_path, (900, 500)).into_drawing_area();
     root.fill(&WHITE)?;
@@ -505,47 +472,20 @@ fn draw_histogram_overlay(
         .y_labels(8)
         .draw()?;
 
-    // 인간: 파란색 반투명
-    chart
-        .draw_series(human_counts.iter().enumerate().map(|(i, &cnt)| {
-            let x0 = x_min + i as f64 * bin_width;
-            let x1 = x0 + bin_width * 0.45; // 나란히 표시
-            Rectangle::new(
-                [(x0, 0), (x1, cnt)],
-                RGBColor(55, 138, 221).mix(0.7).filled(),
-            )
-        }))?
-        .label("Human")
-        .legend(|(x, y)| {
-            Rectangle::new(
-                [(x, y - 6), (x + 16, y + 6)],
-                RGBColor(55, 138, 221).filled(),
-            )
-        });
+    chart.draw_series(counts.iter().enumerate().map(|(i, &cnt)| {
+        let x0 = x_min + i as f64 * bin_width;
+        let x1 = x0 + bin_width * 0.85;
+        Rectangle::new(
+            [(x0, 0), (x1, cnt)],
+            RGBColor(55, 138, 221).mix(0.75).filled(),
+        )
+    }))?;
 
-    // 봇: 주황색 반투명
-    chart
-        .draw_series(bot_counts.iter().enumerate().map(|(i, &cnt)| {
-            let x0 = x_min + i as f64 * bin_width + bin_width * 0.5; // 오프셋
-            let x1 = x0 + bin_width * 0.45;
-            Rectangle::new(
-                [(x0, 0), (x1, cnt)],
-                RGBColor(216, 90, 48).mix(0.75).filled(),
-            )
-        }))?
-        .label("Bot")
-        .legend(|(x, y)| {
-            Rectangle::new(
-                [(x, y - 6), (x + 16, y + 6)],
-                RGBColor(216, 90, 48).filled(),
-            )
-        });
-
-    chart
-        .configure_series_labels()
-        .background_style(WHITE.mix(0.8))
-        .border_style(RGBColor(200, 200, 200))
-        .draw()?;
+    chart.draw_series(counts.iter().enumerate().map(|(i, &cnt)| {
+        let x0 = x_min + i as f64 * bin_width;
+        let x1 = x0 + bin_width * 0.85;
+        Rectangle::new([(x0, 0), (x1, cnt)], RGBColor(30, 100, 180).stroke_width(1))
+    }))?;
 
     root.present()?;
     println!("✅ 히스토그램 저장: {}", file_path);
@@ -553,85 +493,7 @@ fn draw_histogram_overlay(
 }
 
 // ==========================================
-// 8. 시각화: 산점도 (엔트로피 vs anomaly score)
-// ==========================================
-fn draw_scatter(
-    features: &[SessionFeatures],
-    file_path: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let root = BitMapBackend::new(file_path, (900, 600)).into_drawing_area();
-    root.fill(&WHITE)?;
-
-    let x_max = features
-        .iter()
-        .map(|f| f.entropy_seq)
-        .fold(0.0f64, f64::max)
-        * 1.1
-        + 0.1;
-
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Entropy vs Anomaly Score", ("sans-serif", 20))
-        .margin(40)
-        .x_label_area_size(50)
-        .y_label_area_size(55)
-        .build_cartesian_2d(0.0f64..x_max, 0.0f64..1.05f64)?;
-
-    chart
-        .configure_mesh()
-        .x_desc("Shannon Entropy (bits)")
-        .y_desc("Anomaly Score (높을수록 봇 의심)")
-        .x_labels(8)
-        .y_labels(8)
-        .draw()?;
-
-    // 판별 경계선 힌트 (anomaly score 0.5 기준)
-    chart.draw_series(LineSeries::new(
-        vec![(0.0, 0.5), (x_max, 0.5)],
-        RGBColor(220, 220, 220).stroke_width(1),
-    ))?;
-
-    // 인간 세션
-    let human_pts: Vec<(f64, f64)> = features
-        .iter()
-        .filter(|f| !f.is_bot)
-        .map(|f| (f.entropy_seq, f.anomaly_score))
-        .collect();
-    chart
-        .draw_series(
-            human_pts
-                .iter()
-                .map(|&(x, y)| Circle::new((x, y), 6, RGBColor(55, 138, 221).mix(0.7).filled())),
-        )?
-        .label("Human")
-        .legend(|(x, y)| Circle::new((x + 8, y), 6, RGBColor(55, 138, 221).filled()));
-
-    // 봇 세션
-    let bot_pts: Vec<(f64, f64)> = features
-        .iter()
-        .filter(|f| f.is_bot)
-        .map(|f| (f.entropy_seq, f.anomaly_score))
-        .collect();
-    chart
-        .draw_series(bot_pts.iter().map(|&(x, y)| {
-            // 봇은 삼각형 모양 흉내 (작은 십자)
-            EmptyElement::at((x, y)) + Cross::new((0, 0), 7, RGBColor(216, 90, 48).stroke_width(2))
-        }))?
-        .label("Bot")
-        .legend(|(x, y)| Cross::new((x + 8, y), 6, RGBColor(216, 90, 48).stroke_width(2)));
-
-    chart
-        .configure_series_labels()
-        .background_style(WHITE.mix(0.8))
-        .border_style(RGBColor(200, 200, 200))
-        .draw()?;
-
-    root.present()?;
-    println!("✅ 산점도 저장: {}", file_path);
-    Ok(())
-}
-
-// ==========================================
-// 9. 특징 CSV 저장
+// 8. 특징 CSV 저장
 // ==========================================
 fn save_features_csv(
     features: &[SessionFeatures],
@@ -640,21 +502,19 @@ fn save_features_csv(
     let mut f = File::create(path)?;
     writeln!(
         f,
-        "visit_id,is_bot,steps,std_dwell,cv_dwell,entropy_seq,trans_entropy,repeat_ratio,anomaly_score"
+        "visit_id,steps,std_dwell,cv_dwell,entropy_dwell,repeat_ratio,autocorr_lag1"
     )?;
     for feat in features {
         writeln!(
             f,
-            "{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            "{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
             feat.visit_id,
-            feat.is_bot as u8,
             feat.step_count,
             feat.std_dwell,
             feat.cv_dwell,
-            feat.entropy_seq,
-            feat.trans_entropy,
+            feat.entropy_dwell,
             feat.repeat_ratio,
-            feat.anomaly_score,
+            feat.autocorr_lag1,
         )?;
     }
     println!("✅ 특징 CSV 저장: {}", path);
@@ -662,23 +522,36 @@ fn save_features_csv(
 }
 
 // ==========================================
-// 10. 메인 실행부
+// 9. 메인 실행부
 // ==========================================
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 🚀 Rust 고성능 마르코프 체인 경로 분석기 가동 ===\n");
+
+    // 0. 출력 디렉토리 생성
+    fs::create_dir_all(OUT_DIR)?;
+    println!("📂 출력 디렉토리: {}/\n", OUT_DIR);
 
     // 1. 로그 파싱
     let visit_routes = parse_logs("umami_raw_backup.sql")?;
 
     // 2. 분석 실행
-    let result = analyze_sessions(visit_routes, "session_paths.csv")?;
+    let result = analyze_sessions(visit_routes, &format!("{}/session_paths.csv", OUT_DIR))?;
 
     println!("\n=== ✨ Route 분석 완료 ===");
-    println!("📈 Human-like 세션: {}", result.human_count);
-    println!("🤖 Bot-suspect 세션: {}", result.bot_count);
+    println!(
+        "📈 분석된 세션 수 (events >= {}): {}",
+        MIN_EVENTS, result.session_count
+    );
+    println!(
+        "⏭️  스킵된 세션 수 (events < {}):  {}",
+        MIN_EVENTS, result.skipped_count
+    );
 
     // 3. 특징 CSV 저장
-    save_features_csv(&result.session_features, "session_features.csv")?;
+    save_features_csv(
+        &result.session_features,
+        &format!("{}/session_features.csv", OUT_DIR),
+    )?;
 
     // 4. 시각화 준비
     let mut sorted_states: Vec<String> = result.all_states.into_iter().collect();
@@ -686,89 +559,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n🖼️  시각화 생성 중...");
 
-    // 4-1. 전이 확률 히트맵 (확률 정규화)
+    // 4-1. 전이 확률 히트맵
     draw_transition_heatmap(
-        &result.human_transitions,
+        &result.transitions,
         &sorted_states,
-        "Human — Transition Probability Matrix",
-        "heatmap_human.png",
-    )?;
-    draw_transition_heatmap(
-        &result.bot_transitions,
-        &sorted_states,
-        "Bot — Transition Probability Matrix",
-        "heatmap_bot.png",
+        "Transition Probability Matrix",
+        &format!("{}/heatmap_transitions.png", OUT_DIR),
     )?;
 
-    // 4-2. 특징 분리
-    let human_feats: Vec<&SessionFeatures> = result
+    // 4-2. 특징 벡터 추출
+    let std_vals: Vec<f64> = result
         .session_features
         .iter()
-        .filter(|f| !f.is_bot)
+        .map(|f| f.std_dwell)
         .collect();
-    let bot_feats: Vec<&SessionFeatures> = result
+    let cv_vals: Vec<f64> = result.session_features.iter().map(|f| f.cv_dwell).collect();
+    let ent_vals: Vec<f64> = result
         .session_features
         .iter()
-        .filter(|f| f.is_bot)
+        .map(|f| f.entropy_dwell)
         .collect();
-
-    let human_cv: Vec<f64> = human_feats.iter().map(|f| f.cv_dwell).collect();
-    let bot_cv: Vec<f64> = bot_feats.iter().map(|f| f.cv_dwell).collect();
-    let human_ent: Vec<f64> = human_feats.iter().map(|f| f.entropy_seq).collect();
-    let bot_ent: Vec<f64> = bot_feats.iter().map(|f| f.entropy_seq).collect();
-    let human_anom: Vec<f64> = human_feats.iter().map(|f| f.anomaly_score).collect();
-    let bot_anom: Vec<f64> = bot_feats.iter().map(|f| f.anomaly_score).collect();
+    let repeat_vals: Vec<f64> = result
+        .session_features
+        .iter()
+        .map(|f| f.repeat_ratio)
+        .collect();
+    let autocorr_vals: Vec<f64> = result
+        .session_features
+        .iter()
+        .map(|f| f.autocorr_lag1)
+        .collect();
 
     // 4-3. 히스토그램
-    draw_histogram_overlay(
-        &human_cv,
-        &bot_cv,
-        "체류시간 CV 분포 — Human vs Bot",
+    draw_histogram(
+        &std_vals,
+        "체류시간 Std 분포",
+        "Std (seconds)",
+        &format!("{}/hist_std.png", OUT_DIR),
+        12,
+    )?;
+    draw_histogram(
+        &cv_vals,
+        "체류시간 CV 분포",
         "CV (std / mean)",
-        "hist_cv.png",
+        &format!("{}/hist_cv.png", OUT_DIR),
         12,
     )?;
-    draw_histogram_overlay(
-        &human_ent,
-        &bot_ent,
-        "Shannon Entropy 분포 — Human vs Bot",
+    draw_histogram(
+        &ent_vals,
+        "Entropy dwell 분포",
         "Entropy (bits)",
-        "hist_entropy.png",
+        &format!("{}/hist_entropy.png", OUT_DIR),
         12,
     )?;
-    draw_histogram_overlay(
-        &human_anom,
-        &bot_anom,
-        "Anomaly Score 분포 — Human vs Bot",
-        "Anomaly Score",
-        "hist_anomaly.png",
+    draw_histogram(
+        &repeat_vals,
+        "Repeat Ratio 분포",
+        "Repeat Ratio",
+        &format!("{}/hist_repeat.png", OUT_DIR),
+        12,
+    )?;
+    draw_histogram(
+        &autocorr_vals,
+        "자기상관 lag-1 분포",
+        "Autocorrelation",
+        &format!("{}/hist_autocorr.png", OUT_DIR),
         12,
     )?;
 
-    // 4-4. 산점도
-    draw_scatter(&result.session_features, "scatter_entropy_anomaly.png")?;
-
-    // 5. 희소성 분석
+    // 5. Matrix Density
     let state_pow2 = sorted_states.len().pow(2) as f64;
-    let human_density = result.human_transitions.len() as f64 / state_pow2;
-    let bot_density = result.bot_transitions.len() as f64 / state_pow2;
+    let density = result.transitions.len() as f64 / state_pow2;
+    println!("\n=== 📊 Matrix Density ===");
+    println!("💡 Transition Matrix Density: {:.4}", density);
 
-    println!("\n=== 📊 Matrix Density 분석 ===");
-    println!("💡 Human Matrix Density: {:.4}", human_density);
-    println!(
-        "🤖 Bot Matrix Density:   {:.4} (낮을수록 특정 경로만 반복)",
-        bot_density
-    );
-
-    println!("\n=== 📁 생성된 파일 ===");
-    println!("  session_paths.csv       — 세션별 경로 시퀀스");
-    println!("  session_features.csv    — 세션별 특징 벡터");
-    println!("  heatmap_human.png       — 인간 전이 확률 히트맵");
-    println!("  heatmap_bot.png         — 봇 전이 확률 히트맵");
-    println!("  hist_cv.png             — CV 히스토그램");
-    println!("  hist_entropy.png        — 엔트로피 히스토그램");
-    println!("  hist_anomaly.png        — Anomaly Score 히스토그램");
-    println!("  scatter_entropy_anomaly.png — 산점도");
+    println!("\n=== 📁 생성된 파일 ({OUT_DIR}/) ===");
+    println!("  session_paths.csv        — 세션별 경로 시퀀스");
+    println!("  session_features.csv     — 세션별 특징 벡터");
+    println!("  heatmap_transitions.png  — 전이 확률 히트맵");
+    println!("  hist_std.png             — Std 히스토그램");
+    println!("  hist_cv.png              — CV 히스토그램");
+    println!("  hist_entropy.png         — 체류 시간 엔트로피 히스토그램");
+    println!("  hist_repeat.png          — Repeat Ratio 히스토그램");
+    println!("  hist_autocorr.png        — 자기상관 히스토그램");
 
     Ok(())
 }
