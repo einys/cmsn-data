@@ -6,6 +6,8 @@ use std::f64::consts::PI;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 
+const OUT_DIR: &str = "output";
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct Position {
     x: f64,
@@ -232,7 +234,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn draw_entropy_histogram(data: &[f64]) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 도화지 세팅 (800x600 픽셀 크기의 PNG 파일 생성)
-    let root = BitMapBackend::new("mouse_entropy_distribution.png", (800, 600)).into_drawing_area();
+    let file_name: String = "mouse_entropy_distribution.png".to_string();
+    let file_path = format!("{}/{}", OUT_DIR, file_name);
+    let root = BitMapBackend::new(&file_path, (800, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
     // 1.5 데이터를 0.2 단위의 버킷(Bin)으로 쪼개서 히스토그램 데이터 생성
@@ -270,7 +274,7 @@ fn draw_entropy_histogram(data: &[f64]) -> Result<(), Box<dyn std::error::Error>
     }))?;
 
     root.present()?;
-    println!("📊 [시각화 완료] 'mouse_entropy_distribution.png' 파일이 저장되었습니다.");
+    println!("📊 [시각화 완료] '{}' 파일이 저장되었습니다.", file_name);
 
     Ok(())
 }
