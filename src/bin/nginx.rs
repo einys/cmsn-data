@@ -1,0 +1,81 @@
+use glob::glob;
+use regex::Regex;
+use rusqlite::{Connection, params};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. SQLite 데이터베이스 파일 생성 및 연결
+    let home_dir = std::env::var("HOME")?;
+    let db_path = format!("{}/Downloads/ingress_analytics.db", home_dir);
+    let mut conn = Connection::open(&db_path)?;
+
+    // 2. 로그를 담을 테이블 생성 (인덱스까지 추가해서 조회 속도 확보)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS nginx_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT,
+            method TEXT,
+            url TEXT,
+            status INTEGER
+        )",
+        [],
+    )?;
+
+    // 3. 로그 파싱용 정규식
+    let log_regex = Regex::new(
+        r#"(?P<ip>\S+) - \S+ \[[^\]]+\] "(?P<method>\S+) (?P<url>\S+) \S+" (?P<status>\d+) \d+"#,
+    )?;
+
+    // 4. 대상 파일 목록 수집
+    let pattern = format!("{}/Downloads/ingress_nginx_1month_total.log", home_dir);
+    let file_paths: Vec<PathBuf> = glob(&pattern)?.filter_map(Result::ok).collect();
+
+    println!(
+        "총 {}개의 파일을 SQLite로 마이그레이션합니다...",
+        file_paths.len()
+    );
+
+    // 5. SQLite 성능의 핵심: 하나의 대형 트랜잭션으로 묶어서 Write 오버헤드 줄이기
+    let tx = conn.transaction()?;
+
+    {
+        // 최적화된 Insert Statement 준비
+        let mut stmt =
+            tx.prepare("INSERT INTO nginx_logs (ip, method, url, status) VALUES (?1, ?2, ?3, ?4)")?;
+
+        for path in file_paths {
+            if let Ok(file) = File::open(path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().filter_map(Result::ok) {
+                    if let Some(caps) = log_regex.captures(&line) {
+                        let ip = &caps["ip"];
+                        let method = &caps["method"];
+                        let url = &caps["url"];
+                        let status: i32 = caps["status"].parse().unwrap_or(0);
+
+                        // DB에 삽입
+                        stmt.execute(params![ip, method, url, status])?;
+                    }
+                }
+            }
+        }
+    } // stmt의 수명이 여기서 끝나야 commit이 가능합니다.
+
+    // 트랜잭션 커밋
+    tx.commit()?;
+    println!("마이그레이션 완료! DB 파일 위치: {}", db_path);
+
+    // 6. 자주 조회할 컬럼에 인덱스 걸기 (마이그레이션 후에 걸어야 속도가 빠릅니다)
+    println!("인덱스 생성 중...");
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_url ON nginx_logs(url)", [])?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_status ON nginx_logs(status)",
+        [],
+    )?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip ON nginx_logs(ip)", [])?;
+    println!("모든 작업이 완료되었습니다.");
+
+    Ok(())
+}
