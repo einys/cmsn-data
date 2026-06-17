@@ -1,3 +1,6 @@
+// $HOME/Downloads/ingress_nginx_1month_total.log 로
+// $HOME/Downloads/ingress_analytics.db 생성
+
 use glob::glob;
 use regex::Regex;
 use rusqlite::{Connection, params};
@@ -12,24 +15,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::open(&db_path)?;
 
     // 2. 로그를 담을 테이블 생성 (인덱스까지 추가해서 조회 속도 확보)
+    // user_agent 컬럼을 추가했습니다.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS nginx_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT,
             method TEXT,
             url TEXT,
-            status INTEGER
+            status INTEGER,
+            user_agent TEXT
         )",
         [],
     )?;
 
     // 3. 로그 파싱용 정규식
+    // Nginx Combined 포맷 뒷부분의 Referer와 User Agent까지 캡처하도록 확장했습니다.
+    // (?P<user_agent>[^\"]+) 부분이 큰따옴표 안의 UA 문자열을 가져옵니다.
     let log_regex = Regex::new(
-        r#"(?P<ip>\S+) - \S+ \[[^\]]+\] "(?P<method>\S+) (?P<url>\S+) \S+" (?P<status>\d+) \d+"#,
+        r#"(?P<ip>\S+) - \S+ \[[^\]]+\] "(?P<method>\S+) (?P<url>\S+) \S+" (?P<status>\d+) \d+ "[^"]*" "(?P<user_agent>[^"]*)""#,
     )?;
 
     // 4. 대상 파일 목록 수집
-    let pattern = format!("{}/Downloads/ingress_nginx_1month_total.log", home_dir);
+    let pattern = format!("../ingress_nginx_1month_total.log");
     let file_paths: Vec<PathBuf> = glob(&pattern)?.filter_map(Result::ok).collect();
 
     println!(
@@ -42,8 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         // 최적화된 Insert Statement 준비
+        // user_agent 파라미터(?5)를 추가했습니다.
         let mut stmt =
-            tx.prepare("INSERT INTO nginx_logs (ip, method, url, status) VALUES (?1, ?2, ?3, ?4)")?;
+            tx.prepare("INSERT INTO nginx_logs (ip, method, url, status, user_agent) VALUES (?1, ?2, ?3, ?4, ?5)")?;
 
         for path in file_paths {
             if let Ok(file) = File::open(path) {
@@ -54,9 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let method = &caps["method"];
                         let url = &caps["url"];
                         let status: i32 = caps["status"].parse().unwrap_or(0);
+                        // 정규식에서 user_agent 그룹을 추출하며, 매칭되지 않을 경우 공백 지정
+                        let user_agent = caps.name("user_agent").map_or("-", |m| m.as_str());
 
                         // DB에 삽입
-                        stmt.execute(params![ip, method, url, status])?;
+                        stmt.execute(params![ip, method, url, status, user_agent])?;
                     }
                 }
             }
@@ -75,6 +85,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [],
     )?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ip ON nginx_logs(ip)", [])?;
+    // UdgerDB와 연동할 때 고속 조회를 위해 user_agent 컬럼에도 인덱스를 추가합니다.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ua ON nginx_logs(user_agent)",
+        [],
+    )?;
     println!("모든 작업이 완료되었습니다.");
 
     Ok(())

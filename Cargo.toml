@@ -27,3 +27,7 @@ ipnetwork = "0.20.0"
 # nginx 파싱용
 rayon = "1.10"
 glob = "0.3"
+
+# 실시간 진행 프로그래스 바를 위한 크레이트
+indicatif = "0.17"
+csv = "1.4.0"

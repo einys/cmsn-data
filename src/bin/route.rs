@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 
-const OUT_DIR: &str = "output";
+const OUT_DIR: &str = "output/route";
 const MIN_EVENTS: usize = 30; // 통계 신뢰를 위한 최소 이벤트 수
 
 // ==========================================

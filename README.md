@@ -3,24 +3,31 @@
 ## install (rust)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-
 ## route analyze
-cargo run --bin route
+- note: this analysis targets the file named `umami_raw_backup.sql`
+1. run `cargo run --bin route`
+2. check the result `output/route`
 
 ## mouse entropy analyze
-cargo run --bin entropy
+- note: this analysis targets the file named `umami_raw_backup.sql`
+1. run `cargo run --bin entropy`
+2. check the result `output/entropy`
 
-# ip check
-## 1. build (tag: sqlite-viewer)
-docker build -t sqlite-viewer .
+## ip analyze
+1. prepare `../udgardb_v3.dat` file. This is a sqllite database file from udgerdb, contains known crawler ips, etc.
+2. run `cargo run --bin udger`
+3. check the result `output/udger`
 
-## 2. run (prepare ../udgardb_v3.dat first)
-docker run --rm -d \
-  -p 8080:8080 \
-  -v $(pwd)/../udgardb_v3.dat:/data/udgardb_v3.dat \
-  --name my-sqlite-viewer \
-  sqlite-viewer
 
-## search
-cargo run --bin udger -- 8.8.8.8
 
+## repository architecture
+.
+├── bot_scenarios.csv
+├── Cargo.lock
+├── Cargo.toml
+├── output **analysis results**
+├── README.md
+├── src
+│   └── bin **analysis core logics**
+├── target
+└── umami_raw_backup.sql **user data**

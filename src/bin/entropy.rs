@@ -6,7 +6,7 @@ use std::f64::consts::PI;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 
-const OUT_DIR: &str = "output";
+const OUT_DIR: &str = "output/entropy";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct Position {
