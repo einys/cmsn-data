@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 
 const OUT_DIR: &str = "output/entropy";
+const MIN_MOUSE_POINTS_MOVEMENT: usize = 10;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct Position {
@@ -122,8 +123,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_processed = 0;
     let mut visit_map: HashMap<String, VisitGroup> = HashMap::new();
 
+    // create save file if not exists
+    if !std::path::Path::new(OUT_DIR).exists() {
+        std::fs::create_dir_all(OUT_DIR)?;
+    }
+
     // 분석 결과 저장을 위한 CSV 파일 생성 및 헤더 작성
-    let mut csv_file = std::io::BufWriter::new(File::create("mouse_entropy_analysis.csv")?);
+    let mut csv_file = std::io::BufWriter::new(File::create(format!(
+        "{}/mouse_entropy_analysis.csv",
+        OUT_DIR
+    ))?);
     writeln!(
         csv_file,
         "replay_id,session_id,visit_id,move_count,chunk_entropy_score,raw_movements"
@@ -210,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔄 visit_id 그룹별 그래프용 엔트로피 연산 시작...");
     let mut visit_entropy_values = Vec::new();
     for group in visit_map.values() {
-        if group.positions.len() >= 5 {
+        if group.positions.len() >= MIN_MOUSE_POINTS_MOVEMENT {
             let total_entropy = calculate_mouse_entropy(&group.positions);
             visit_entropy_values.push(total_entropy);
         }

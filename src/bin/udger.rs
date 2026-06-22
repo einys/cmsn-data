@@ -8,6 +8,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use plotters::prelude::*;
 
 const OUT_DIR: &str = "output/udger";
+// 통계 출력을 위한 전역 상수 정의
+const TOP_N_DC: usize = 10;
+const TOP_N_COUNTRY: usize = 10;
+const TOP_N_URL: usize = 20;
+const TOP_N_CRAWLER: usize = 10;
+
+const KNOWN_IP_DATA: &str = "../udgerdb_v3.dat";
+const INGRESS_DATA: &str = "../ingress_analytics.db";
 
 fn ip_to_long(ip: &IpAddr) -> Option<u32> {
     match ip {
@@ -100,16 +108,109 @@ fn save_to_csv(
     Ok(())
 }
 
+// 단일 IP의 봇/데이터센터 여부를 조회하는 헬퍼 함수
+fn check_single_ip(
+    udger_conn: &Connection,
+    ip_str: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ip_addr: IpAddr = match ip_str.parse() {
+        Ok(addr) => addr,
+        Err(_) => {
+            println!("❌ 유효하지 않은 IP 주소 형식입니다: {}", ip_str);
+            return Ok(());
+        }
+    };
+
+    println!("\n=====================================================================");
+    println!("🔍 단일 IP UdgerDB 정밀 조회: {}", ip_str);
+    println!("=====================================================================");
+
+    let mut is_detected = false;
+
+    // [A] 데이터센터 조회
+    if let Some(ip_long) = ip_to_long(&ip_addr) {
+        let mut dc_stmt = udger_conn.prepare(
+            "SELECT l.name, l.homepage FROM udger_datacenter_range r 
+             JOIN udger_datacenter_list l ON r.datacenter_id = l.id 
+             WHERE ?1 BETWEEN r.iplong_from AND r.iplong_to LIMIT 1",
+        )?;
+        let mut dc_rows = dc_stmt.query(params![ip_long])?;
+        if let Some(dc_row) = dc_rows.next()? {
+            let dc_name: String = dc_row.get(0)?;
+            let dc_home: String = dc_row.get(1).unwrap_or_else(|_| "-".to_string());
+            println!("🏢 [데이터센터 검출]");
+            println!("  - 인프라명: {}", dc_name);
+            println!("  - 홈페이지: {}", dc_home);
+            is_detected = true;
+        }
+    }
+
+    // [B] 알려진 봇/크롤러 IP 조회 (기존 main 구조와 일치하도록 스키마 안정성 확보)
+    let mut ip_list_stmt = udger_conn.prepare(
+        "SELECT i.ip_country, c.name 
+         FROM udger_ip_list i
+         LEFT JOIN udger_crawler_list c ON i.crawler_id = c.id
+         WHERE i.ip = ?1 LIMIT 1",
+    )?;
+
+    let mut ip_list_rows = ip_list_stmt.query(params![ip_str])?;
+    if let Some(ip_list_row) = ip_list_rows.next()? {
+        let country: Option<String> = ip_list_row.get(0)?;
+        let crawler_name: Option<String> = ip_list_row.get(1)?;
+        let crawler_family: Option<String> = ip_list_row.get(2)?;
+        let author: Option<String> = ip_list_row.get(3)?;
+        let author_url: Option<String> = ip_list_row.get(4)?;
+
+        println!("\n🤖 [알려진 IP/봇 검출]");
+        println!(
+            "  - 국가: {}",
+            country.unwrap_or_else(|| "Unknown".to_string())
+        );
+        println!(
+            "  - 봇 이름: {}",
+            crawler_name.unwrap_or_else(|| "Unclassified Bot".to_string())
+        );
+        println!(
+            "  - 계열(Family): {}",
+            crawler_family.unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  - 제작사(Author): {} ({})",
+            author.unwrap_or_else(|| "-".to_string()),
+            author_url.unwrap_or_else(|| "-".to_string())
+        );
+        is_detected = true;
+    }
+
+    if !is_detected {
+        println!("✅ UdgerDB에 등록되지 않은 일반 IP이거나 탐지되지 않은 주소입니다.");
+    }
+    println!("=====================================================================\n");
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CLI 인자 파싱 (첫 번째 인자는 실행 파일 경로이므로 두 번째 인자가 IP인지 확인)
+    let args: Vec<String> = std::env::args().collect();
+
+    // 1. DB 로드 (공통 사용)
+    let udger_conn = Connection::open(KNOWN_IP_DATA)?;
+
+    if args.len() > 1 {
+        // 인자가 주어지면 단일 IP 조회 CLI 모드로 동작
+        check_single_ip(&udger_conn, &args[1])?;
+        return Ok(());
+    }
+
+    // 인자가 없으면 기존 전체 통계 분석 모드로 동작
+    println!("⚙️ Udger 데이터베이스 로드 성공.");
+
     // 0. 출력 디렉토리 생성
     fs::create_dir_all(OUT_DIR)?;
 
-    // 1. DB 로드 및 결합
-    let udger_conn = Connection::open("../udgerdb_v3.dat")?;
-    println!("⚙️ Udger 데이터베이스 로드 성공.");
-
     udger_conn.execute(
-        "ATTACH DATABASE '../ingress_analytics.db' AS ingress_db",
+        &format!("ATTACH DATABASE {} AS ingress_db", INGRESS_DATA),
         [],
     )?;
     println!("⚙️ 인그레스 로그 DB 결합 완료.");
@@ -234,30 +335,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("\n[ 🏢 데이터센터별 유입 통계 (Top 5) ]");
+    println!("\n[ 🏢 데이터센터별 유입 통계 (Top {}) ]", TOP_N_DC);
     let mut dc_vec: Vec<(&String, &u64)> = datacenter_stats.iter().collect();
     dc_vec.sort_by(|a, b| b.1.cmp(a.1));
     let max_dc = dc_vec.first().map(|x| *x.1).unwrap_or(0);
-    for (name, count) in dc_vec.iter().take(5) {
+    for (name, count) in dc_vec.iter().take(TOP_N_DC) {
         let bar = draw_bar_chart(**count, max_dc, 30);
         println!("- {:<30} : {:>8} 건 {}", name, count, bar);
     }
 
-    println!("\n[ 🗺️ 알려진 IP 리스트 국가별 통계 (Top 5) ]");
+    println!(
+        "\n[ 🗺️ 알려진 IP 리스트 국가별 통계 (Top {}) ]",
+        TOP_N_COUNTRY
+    );
     let mut ip_vec: Vec<(&String, &u64)> = known_ip_stats.iter().collect();
     ip_vec.sort_by(|a, b| b.1.cmp(a.1));
     let max_ip = ip_vec.first().map(|x| *x.1).unwrap_or(0);
-    for (country, count) in ip_vec.iter().take(5) {
+    for (country, count) in ip_vec.iter().take(TOP_N_COUNTRY) {
         let bar = draw_bar_chart(**count, max_ip, 30);
         println!("- {:<30} : {:>8} 건 {}", country, count, bar);
     }
 
-    println!("\n[ 🎯 알려진 IP(봇/크롤러)의 다빈도 방문 경로 (Top 20) ]");
+    println!(
+        "\n[ 🎯 알려진 IP(봇/크롤러)의 다빈도 방문 경로 (Top {}) ]",
+        TOP_N_URL
+    );
     let mut url_vec: Vec<(&String, &u64)> = known_ip_url_stats.iter().collect();
     url_vec.sort_by(|a, b| b.1.cmp(a.1));
     let max_url = url_vec.first().map(|x| *x.1).unwrap_or(0);
 
-    for (url, count) in url_vec.iter().take(20) {
+    for (url, count) in url_vec.iter().take(TOP_N_URL) {
         let bar = draw_bar_chart(**count, max_url, 30);
         let display_url = if url.len() > 45 {
             format!("{}...", &url[..42])
@@ -268,12 +375,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // [새 분석 지표] 매칭된 알려진 IP의 크롤러/유저 에이전트 통계 출력
-    println!("\n[ 🤖 매칭된 알려진 IP의 크롤러/봇 식별 통계 (Top 10) ]");
+    println!(
+        "\n[ 🤖 매칭된 알려진 IP의 크롤러/유저 에이전트 식별 통계 (Top {}) ]",
+        TOP_N_CRAWLER
+    );
     let mut crawler_vec: Vec<(&String, &u64)> = crawler_name_stats.iter().collect();
     crawler_vec.sort_by(|a, b| b.1.cmp(a.1));
     let max_crawler = crawler_vec.first().map(|x| *x.1).unwrap_or(0);
 
-    for (crawler_name, count) in crawler_vec.iter().take(10) {
+    for (crawler_name, count) in crawler_vec.iter().take(TOP_N_CRAWLER) {
         let bar = draw_bar_chart(**count, max_crawler, 30);
         let display_name = if crawler_name.len() > 30 {
             format!("{}...", &crawler_name[..27])
@@ -289,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=====================================================================");
 
     // 데이터센터 통계 파일화
-    let top_dc_data: Vec<(&String, &u64)> = dc_vec.iter().take(5).cloned().collect();
+    let top_dc_data: Vec<(&String, &u64)> = dc_vec.iter().take(TOP_N_DC).cloned().collect();
     save_to_csv(
         &format!("{}/datacenter_stats.csv", OUT_DIR),
         &["Datacenter", "Requests"],
@@ -297,12 +407,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     save_chart_image(
         &format!("{}/datacenter_chart.png", OUT_DIR),
-        "Top 5 Datacenter Infrastructure Traffic",
+        &format!("Top {} Datacenter Infrastructure Traffic", TOP_N_DC),
         &top_dc_data,
     )?;
 
     // 봇 식별 명세 통계 파일화
-    let top_crawler_data: Vec<(&String, &u64)> = crawler_vec.iter().take(10).cloned().collect();
+    let top_crawler_data: Vec<(&String, &u64)> =
+        crawler_vec.iter().take(TOP_N_CRAWLER).cloned().collect();
     save_to_csv(
         &format!("{}/crawler_stats.csv", OUT_DIR),
         &["Crawler_Name", "Requests"],
@@ -310,12 +421,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     save_chart_image(
         &format!("{}/crawler_chart.png", OUT_DIR),
-        "Top 10 Identified Bot Traffic (UdgerDB)",
+        &format!("Top {} Identified Bot Traffic (UdgerDB)", TOP_N_CRAWLER),
         &top_crawler_data,
     )?;
 
     // 다빈도 표적 경로 명세 통계 파일화
-    let top_url_data: Vec<(&String, &u64)> = url_vec.iter().take(10).cloned().collect();
+    let top_url_data: Vec<(&String, &u64)> = url_vec.iter().take(TOP_N_URL).cloned().collect();
     save_to_csv(
         &format!("{}/target_url_stats.csv", OUT_DIR),
         &["Target_URL", "Requests"],
@@ -323,7 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     save_chart_image(
         &format!("{}/target_url_chart.png", OUT_DIR),
-        "Top 10 Target Endpoints Visited by Bots",
+        &format!("Top {} Target Endpoints Visited by Bots", TOP_N_URL),
         &top_url_data,
     )?;
 

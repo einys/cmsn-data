@@ -1,5 +1,6 @@
 use chrono::DateTime;
 use plotters::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -33,6 +34,41 @@ struct AnalysisResult {
     session_count: usize,
     skipped_count: usize, // MIN_EVENTS 미만으로 스킵된 세션 수
     session_features: Vec<SessionFeatures>,
+}
+
+// ==========================================
+// 마르코프 모델 학습 결과 저장용 구조체
+// ==========================================
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MarkovDetector {
+    // (From_State, To_State) -> Probability(확률) 구조의 전이 확률 지도
+    pub tpm: HashMap<(String, String), f64>,
+    // 학습 데이터에 없는 돌발/스캔 경로 진입 시 부여할 라플라스 패널티 스무딩 계수
+    pub state_alpha: f64,
+}
+
+impl MarkovDetector {
+    // 기존에 누적된 전이 빈도수(Transitions)를 기반으로 정규화된 확률 지도 생성
+    pub fn train(transitions: &HashMap<(String, String), usize>) -> Self {
+        let mut row_sums: HashMap<String, usize> = HashMap::new();
+        for ((from, _), &cnt) in transitions {
+            *row_sums.entry(from.clone()).or_insert(0) += cnt;
+        }
+
+        let mut tpm = HashMap::new();
+        for ((from, to), &cnt) in transitions {
+            let sum = *row_sums.get(from).unwrap_or(&0);
+            if sum > 0 {
+                tpm.insert((from.clone(), to.clone()), cnt as f64 / sum as f64);
+            }
+        }
+
+        // 기본 패널티 스무딩 값을 0.0001로 지정하여 제로데이 경로 차단력 확보
+        MarkovDetector {
+            tpm,
+            state_alpha: 0.0001,
+        }
+    }
 }
 
 // ==========================================
@@ -626,6 +662,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &format!("{}/hist_autocorr.png", OUT_DIR),
         12,
     )?;
+
+    // =====================================================================
+    // ⚙️ 학습된 마르코프 지도를 이진 파일로 영구 저장하는 파트
+    // =====================================================================
+    println!("\n💾 실시간 탐지용 마르코프 정상성 지도 모델 압축 및 저장 중...");
+    let detector = MarkovDetector::train(&result.transitions);
+    let mut model_file = File::create("normal_markov_model.bin")?;
+    let encoded = bincode::serialize(&detector)?;
+    model_file.write_all(&encoded)?;
+    println!("✅ 모델 파일 생성 완료: normal_markov_model.bin");
+    // =====================================================================
 
     // 5. Matrix Density
     let state_pow2 = sorted_states.len().pow(2) as f64;
