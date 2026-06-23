@@ -21,13 +21,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 
 ## repository architecture
+```
 .
 ├── bot_scenarios.csv
 ├── Cargo.lock
 ├── Cargo.toml
-├── output **analysis results**
+├── output                  # analysis results
 ├── README.md
 ├── src
-│   └── bin **analysis core logics**
+│   └── bin                 # analysis core logic
 ├── target
-└── umami_raw_backup.sql **user data**
+└── umami_raw_backup.sql    # analysis target data
+```
