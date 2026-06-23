@@ -2,3 +2,10 @@
 **/*/target
 
 *.dat
+
+
+**/*/ip
+
+**/*/udgar
+
+**/*/known_ips.csv

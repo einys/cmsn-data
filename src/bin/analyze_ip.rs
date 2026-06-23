@@ -1,8 +1,9 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 
 // 메모리 오버헤드를 최소화한 실시간 세션 구조체
 #[derive(Default)]
@@ -17,6 +18,7 @@ struct LiveSession {
 }
 
 const OUTPUT_FILE_NAME: &str = "output/ip/detected_bots.csv";
+const OUTPUT_TEXT_FILE_NAME: &str = "output/ip/detected_bots.txt";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🛡️ 경량화된 실시간 2축(404 + 정적자원) 봇 탐지 엔진 가동...");
@@ -115,8 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             session.total_requests += 1;
 
-            // 1. 400 이상 에러 카운트 (400, 401, 403, 404, 500 등)
-            if status_code >= 400 {
+            // 1. 400 이상 에러 카운트 (400, 401, 403, 404)
+            if status_code == 400 || status_code == 401 || status_code == 403 || status_code == 404
+            {
                 session.bad_status_count += 1;
             }
 
@@ -200,8 +203,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     bot_details.sort_by_key(|(ip, _)| *ip); // 가독성을 위해 IP 정렬
 
+    // 1. OUTPUT_FILE_NAME의 상위 폴더가 없다면 모두 생성
+    if let Some(parent) = Path::new(OUTPUT_FILE_NAME).parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // 2. OUTPUT_TEXT_FILE_NAME의 상위 폴더가 없다면 모두 생성
+    if let Some(parent) = Path::new(OUTPUT_TEXT_FILE_NAME).parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = File::create(OUTPUT_FILE_NAME)?;
-    writeln!(file, "IP,DetectionType,BadStatusRatio,StaticResourceRatio")?; // 헤더 추가
+    let mut text_file = File::create(OUTPUT_TEXT_FILE_NAME)?;
+
+    writeln!(file, "IP,DetectionType,BadStatusRatio,StaticResourceRatio")?; // csv 헤더 추가
 
     for (ip, session) in &bot_details {
         let bad_status_ratio = if session.total_requests > 0 {
@@ -209,8 +223,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             0.0
         };
-        let static_resource_ratio = if session.dynamic_count > 0 {
-            session.static_count as f64 / session.dynamic_count as f64
+        let static_percentage = if session.total_requests > 0 {
+            session.static_count as f64 / session.total_requests as f64
         } else {
             0.0
         };
@@ -223,7 +237,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .unwrap_or(&"Unknown".to_string()),
             bad_status_ratio * 100.0, // 백분율로 표시
-            static_resource_ratio
+            static_percentage
+        )?;
+
+        // 보기 좋은 텍스트 파일로도 저장.
+        // 저장 내용: println!("🚨 [봇 검출] IP: {} | 타입: {} | 400+비율: {:.0}% | 정적자원비율: {:.2}",
+        writeln!(
+            text_file,
+            "🚨 [BOT] IP: {} | Type: {} | 400+ ratio: {:.0}% | Static resource ratio: {:.2}",
+            ip,
+            session
+                .detection_type
+                .as_ref()
+                .unwrap_or(&"Unknown".to_string()),
+            bad_status_ratio * 100.0, // 백분율로 표시
+            static_percentage
         )?;
     }
 
