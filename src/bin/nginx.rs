@@ -17,7 +17,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // user_agent 컬럼을 추가했습니다.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS nginx_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT,
             timestamp TEXT,
             method TEXT,
