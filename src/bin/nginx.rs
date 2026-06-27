@@ -22,7 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             method TEXT,
             url TEXT,
             status INTEGER,
-            user_agent TEXT
+            user_agent TEXT,
+            host TEXT
         )",
         [],
     )?;
@@ -50,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 최적화된 Insert Statement 준비
         // user_agent 파라미터(?5)를 추가했습니다.
         let mut stmt =
-            tx.prepare("INSERT INTO nginx_logs (ip, timestamp, method, url, status, user_agent) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+            tx.prepare("INSERT INTO nginx_logs (ip, timestamp, method, url, status, user_agent, host) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
 
         for path in file_paths {
             if let Ok(file) = File::open(path) {
@@ -64,9 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let status: i32 = caps["status"].parse().unwrap_or(0);
                         // 정규식에서 user_agent 그룹을 추출하며, 매칭되지 않을 경우 공백 지정
                         let user_agent = caps.name("ua").map_or("-", |m| m.as_str());
+                        // host 컬럼도 추출
+                        let host = caps.name("host").map_or("-", |m| m.as_str());
 
                         // DB에 삽입
-                        stmt.execute(params![ip, timestamp, method, url, status, user_agent])?;
+                        stmt.execute(params![
+                            ip, timestamp, method, url, status, user_agent, host
+                        ])?;
                     }
                 }
             }

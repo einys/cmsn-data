@@ -6,6 +6,9 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
+const THRESHOLD_400_RATIO: f64 = 0.40; // 400+ 상태 코드 비율 임계값 (40% 이상이면 봇으로 간주)
+const MIN_REQUESTS_FOR_DETECTION: u64 = 15; // 최소 요청 수 (15회 이상일 때만 판정)
+
 // 메모리 오버헤드를 최소화한 실시간 세션 구조체
 #[derive(Default)]
 struct LiveSession {
@@ -116,12 +119,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session.bad_status_count += 1;
             }
 
-            // 복합 행동 실시간 판정 (IP당 최소 요청 15회 이상 쌓였을 때)
-            if session.total_requests >= 15 {
+            // 복합 행동 실시간 판정 (IP당 최소 요청 횟수 이상 쌓였을 때)
+            if session.total_requests >= MIN_REQUESTS_FOR_DETECTION {
                 let bad_status_ratio = session.bad_status_ratio();
 
                 // 판정 필터 A: 민감 정보만 찌르고 다니는 404 악성 스캐너 (Advin 같은 봇)
-                let is_vulnerability_scanner = bad_status_ratio > 0.80;
+                let is_vulnerability_scanner = bad_status_ratio > THRESHOLD_400_RATIO;
 
                 if is_vulnerability_scanner {
                     if ua.contains("googlebot")
